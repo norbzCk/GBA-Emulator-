@@ -5,6 +5,7 @@
 
 #include "../cpu/cpu.h"
 #include "../memory/memory.h"
+#include "../sound/sound.h"
 
 /* Forward declarations. */
 typedef struct PPU PPU;
@@ -94,6 +95,9 @@ typedef struct HW {
 
     HWTimer   timer[4];
     DmaChannel dma[4];
+
+    /* Sound: the PSG, the DirectSound FIFOs and the mixer. */
+    Sound     sound;
 } HW;
 
 void     hw_init(HW *hw, Memory *mem, CPU *cpu, PPU *ppu);

@@ -4,12 +4,17 @@ LDLIBS := -lm
 TARGET := gba
 TEST   := tests
 
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+DATADIR ?= $(PREFIX)/share
+
 CORE_SRCS := src/emulator/emulator.c \
              src/cpu/cpu.c \
              src/cpu/thumb.c \
              src/cpu/bios.c \
              src/memory/memory.c \
              src/hw/hw.c \
+             src/sound/sound.c \
              src/ppu/ppu.c
 
 SRCS := src/runner.c $(CORE_SRCS)
@@ -36,9 +41,16 @@ $(TEST): $(TEST_OBJS)
 test: $(TEST)
 	./$(TEST)
 
+install: $(TARGET)
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 755 $(TARGET) $(DESTDIR)$(BINDIR)/$(TARGET)
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/$(TARGET)
+
 clean:
 	rm -f $(OBJS) $(TEST_OBJS) $(DEPS) $(TARGET) $(TEST)
 
 -include $(DEPS)
 
-.PHONY: all test clean
+.PHONY: all test install uninstall clean

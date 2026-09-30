@@ -12,9 +12,41 @@
 #define GBA_VRAM_SIZE  0x18000
 #define GBA_OAM_SIZE   0x400
 #define GBA_ROM_SIZE   0x2000000
-#define GBA_SRAM_SIZE  0x10000
+#define GBA_SAVE_SIZE  0x20000   /* largest cartridge backup: 128 KB EEPROM */
 
 struct HW;
+
+/* Cartridge backup chips.  The backup lives in the 0x0A000000-0x0D00FFFF
+ * window, but each kind answers differently: SRAM is plain memory, Flash
+ * is a command-driven chip and EEPROM is a bit-serial device. */
+enum {
+    SAVE_NONE = 0,
+    SAVE_SRAM,     /* 8/32/64 KB of plain memory */
+    SAVE_EEPROM,   /* 512 B - 128 KB, bit-serial at 0x0D000000 */
+    SAVE_FLASH     /* 64/128 KB, command driven */
+};
+
+/* Bit-serial phase of an EEPROM access. */
+enum {
+    EEP_ADDR = 0,  /* shifting in an address, terminated by a 1 bit */
+    EEP_DATA       /* shifting the payload in or out */
+};
+
+typedef struct CartSave {
+    uint32_t kind;
+    uint32_t size;      /* bytes of `data` in use */
+    uint32_t bank;      /* selected flash bank */
+    uint32_t flash_cmd; /* pending flash command, 0 when none */
+    uint32_t flash_cmd_addr;
+    uint32_t step;       /* which part of an access is in progress */
+    uint32_t addr;       /* address bits collected so far */
+    uint32_t steps_left; /* bits still expected in the current step */
+    uint32_t addr_bits;  /* address width: the chip knows this, it is fixed */
+    uint32_t data_bits;  /* payload width: 2 for the narrow chips, else 8 */
+    uint32_t bit_index;  /* next payload bit to hand out on a read */
+    uint32_t pad;        /* trailing bits of a byte that belong to no access */
+    uint8_t  data[GBA_SAVE_SIZE];
+} CartSave;
 
 typedef struct Memory {
     uint8_t  bios[GBA_BIOS_SIZE];
@@ -24,7 +56,7 @@ typedef struct Memory {
     uint8_t  pal[GBA_PAL_SIZE];
     uint8_t  vram[GBA_VRAM_SIZE];
     uint8_t  oam[GBA_OAM_SIZE];
-    uint8_t  sram[GBA_SRAM_SIZE];
+    CartSave save;
     uint8_t *rom;
     uint32_t rom_size;
     struct HW *hw;   /* set via memory_set_io to route the MMIO region */

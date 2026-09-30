@@ -24,7 +24,9 @@ typedef struct Emulator {
 
     int      has_bios;        /* a real BIOS image is mapped at 0x00000000 */
     uint64_t frames;          /* completed frames */
-    uint16_t prev_ppu_irq;    /* last dispstat IRQ flags, for edge detect */
+    uint16_t prev_ppu_irq;     /* last DISPSTAT interrupt conditions */
+    uint16_t prev_ppu_period;  /* last DISPSTAT VBlank/HBlank status bits */
+    uint32_t cycle_carry;     /* CPU cycles overrun from the previous slice */
 } Emulator;
 
 void     emulator_init(Emulator *emu);
@@ -51,5 +53,12 @@ void emulator_frame(Emulator *emu);
 
 /* Software interrupt hook, installed into the CPU by emulator_reset(). */
 void emulator_swi(void *ctx, uint32_t number);
+
+/* ---- audio ---------------------------------------------------------------- */
+
+/* The mixer runs at a fixed rate; drain interleaved stereo 16 bit frames from
+ * the sound engine's ring buffer. Returns how many frames were available. */
+#define EMULATOR_AUDIO_RATE 32768u
+uint32_t emulator_audio_read(Emulator *emu, int16_t *out, uint32_t frames);
 
 #endif

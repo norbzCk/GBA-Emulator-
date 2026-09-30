@@ -115,7 +115,9 @@ static int obj_slot(int tpid, int oned, int tpr, int lx, int ly) {
 }
 
 /* One object pixel; returns 0 for transparent. An 8bpp tile is 64 bytes,
- * a 4bpp tile 32. */
+ * a 4bpp tile 32.  Only the 4bpp form has a transparent index: in 8bpp every
+ * one of the 256 entries is a real colour, index 0 included, so the caller
+ * has to decide transparency from the bit depth rather than from the value. */
 static int obj_pixel(PPU *ppu, int slot, int bits, int pbk, int lx, int ly) {
     if (bits == 8) {
         uint32_t base = 0x06010000u + (uint32_t)slot * 64u;
@@ -125,6 +127,11 @@ static int obj_pixel(PPU *ppu, int slot, int bits, int pbk, int lx, int ly) {
     uint8_t byte = vr8(ppu, base + (uint32_t)ly * 4u + ((uint32_t)lx >> 1));
     int idx = (lx & 1) ? (byte >> 4) : (byte & 0xF);
     return idx ? idx + pbk * 16 : 0;
+}
+
+/* Whether a sampled index covers its pixel. */
+static int obj_solid(int bits, int idx) {
+    return bits == 8 || idx != 0;
 }
 
 static void draw_obj(PPU *ppu, int y, Px *out, Px *under, uint8_t *objwin, int i) {
@@ -166,7 +173,7 @@ static void draw_obj(PPU *ppu, int y, Px *out, Px *under, uint8_t *objwin, int i
             /* `px` picks the tile column, `lx` the dot inside that tile. */
             int slot = obj_slot(tpid, oned, tpr, px, ly);
             int idx = obj_pixel(ppu, slot, bits, pbk, lx, row);
-            if (idx) {
+            if (obj_solid(bits, idx)) {
                 if (objmode == 2) {
                     /* Object window mode: the object is not drawn, it only
                      * marks the object window region. */
@@ -212,7 +219,7 @@ static void draw_obj(PPU *ppu, int y, Px *out, Px *under, uint8_t *objwin, int i
 
         int slot = obj_slot(tpid, oned, tpr, tu, tv);
         int idx = obj_pixel(ppu, slot, bits, pbk, tu & 7, tv & 7);
-        if (idx) {
+        if (obj_solid(bits, idx)) {
             if (objmode == 2) {
                 objwin[dx] = 1;
             } else {
@@ -341,7 +348,11 @@ static void render_bg_text(PPU *ppu, int b, int y, Px *out, Px *under) {
         uint32_t taddr = (uint32_t)cbb * 0x4000u;
         int idx;
         if (eight) {
+            /* 8bpp: all 256 entries are colours, so index 0 still covers its
+             * pixel and the tile index in the map cannot be zero-skipped. */
             idx = vr8(ppu, taddr + (uint32_t)tid * 64u + (uint32_t)ly * 8u + (uint32_t)lx);
+            put(out, under, x, c15(pal16(ppu, (uint32_t)idx)), b, 0);
+            continue;
         } else {
             uint8_t byte = vr8(ppu, taddr + (uint32_t)tid * 32u + (uint32_t)ly * 4u + ((uint32_t)lx >> 1));
             idx = (lx & 1) ? (byte >> 4) : (byte & 0xF);
@@ -385,11 +396,11 @@ static void render_bg_affine(PPU *ppu, int b, int y, Px *out, Px *under) {
         uint8_t tid = vr8(ppu, mapbase + (uint32_t)(my >> 3) * (uint32_t)mapw + (uint32_t)(mx >> 3));
         if (tid) {
             uint32_t taddr = (uint32_t)cbb * 0x4000u;
+            /* Affine backgrounds are always 8bpp, so the index is a colour
+             * and never a transparent hole. */
             uint8_t index = vr8(ppu, taddr + (uint32_t)tid * 64u
                             + (uint32_t)(my & 7) * 8u + (uint32_t)(mx & 7));
-            if (index) {
-                put(out, under, x, c15(pal16(ppu, index)), b, 0);
-            }
+            put(out, under, x, c15(pal16(ppu, index)), b, 0);
         }
 
         curx += pa * 256;
@@ -408,11 +419,11 @@ static void render_bg_bitmap(PPU *ppu, int y, Px *out, Px *under) {
             put(out, under, x, c15(vr16(ppu, (uint32_t)(y * PPU_W + x) * 2u)), LYR_BG2, 0);
         }
     } else if (mode == 4) {
+        /* Mode 4 is an 8bpp indexed bitmap: no entry is transparent, so
+         * index 0 shows palette colour 0 like every other one. */
         for (int x = 0; x < PPU_W; x++) {
             uint8_t idx = vr8(ppu, (uint32_t)page * 0xA000u + (uint32_t)(y * PPU_W + x));
-            if (idx) {
-                put(out, under, x, c15(pal16(ppu, idx)), LYR_BG2, 0);
-            }
+            put(out, under, x, c15(pal16(ppu, idx)), LYR_BG2, 0);
         }
     } else { /* mode 5 */
         if (y >= 128) return;

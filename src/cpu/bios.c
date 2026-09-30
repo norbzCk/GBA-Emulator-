@@ -618,7 +618,9 @@ void bios_swi(Memory *mem, CPU *cpu, HW *hw, uint32_t number) {
         case SWI_SOFT_RESET:
             cpu_reset(cpu);
             cpu_write_reg(cpu, 13, 0x03007F00u);
-            cpu->reg[15] = 0x08000000u;
+            /* cpu_set_pc, not a direct write: the step loop overwrites R15
+             * with the next sequential address unless the PC was flagged. */
+            cpu_set_pc(cpu, 0x08000000u);
             break;
 
         case SWI_REGISTER_RAM_RESET:

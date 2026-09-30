@@ -194,17 +194,45 @@ static int write_ppm(const char *path, const uint32_t *pixels) {
     return 1;
 }
 
+/* ---- WAV output ----------------------------------------------------------- */
+
+static void wav_write_header(FILE *f, uint32_t frames) {
+    uint32_t data = frames * 2u * sizeof(int16_t);
+    uint32_t rate = EMULATOR_AUDIO_RATE;
+    uint8_t h[44];
+
+    memcpy(h + 0, "RIFF", 4);
+    uint32_t riff = 36u + data;
+    memcpy(h + 4, &riff, 4);
+    memcpy(h + 8, "WAVEfmt ", 8);
+    uint32_t fmt_len = 16;
+    memcpy(h + 16, &fmt_len, 4);
+    uint16_t audio_fmt = 1, ch = 2, bits = 16;
+    uint16_t block = 2;
+    memcpy(h + 20, &audio_fmt, 2);
+    memcpy(h + 22, &ch, 2);
+    memcpy(h + 24, &rate, 4);
+    uint32_t byte_rate = rate * 4u;
+    memcpy(h + 28, &byte_rate, 4);
+    memcpy(h + 32, &block, 2);
+    memcpy(h + 34, &bits, 2);
+    memcpy(h + 36, "data", 4);
+    memcpy(h + 40, &data, 4);
+    fwrite(h, 1, sizeof h, f);
+}
+
 /* ---- CLI ----------------------------------------------------------------- */
 
 static void print_usage(void) {
     printf("usage: gba <rom.gba> [options]\n"
            "\n"
            "options:\n"
-           "  --frames N      stop after N frames (default 600)\n"
+           "  --frames N      stop after N frames (default: run until you quit)\n"
            "  --bios FILE     use a real 16 KB BIOS instead of the built-in one\n"
            "  --save FILE     cartridge backup (default: <rom>.sav)\n"
            "  --no-save       never read or write the backup file\n"
            "  --dump FILE     write the last frame as a PPM image\n"
+           "  --wav FILE      write 16 bit stereo audio ('-' for stdout)\n"
            "  --headless      no terminal preview\n"
            "  --scale N       preview subsampling factor (default: auto)\n"
            "  --no-sleep      run as fast as possible, ignoring 60 fps pacing\n"
@@ -239,7 +267,7 @@ static double now_seconds(void) {
 
 int main(int argc, const char *argv[]) {
     Emulator emu;
-    uint32_t frames = 600;
+    uint32_t frames = 0; /* 0 = run until the user quits */
     int      headless = 0;
     int      no_input = 0;
     int      no_save = 0;
@@ -248,6 +276,7 @@ int main(int argc, const char *argv[]) {
     const char *dump = NULL;
     const char *bios = NULL;
     const char *save = NULL;
+    const char *wav = NULL;
     char     *own_save = NULL;
     const char *rom = NULL;
 
@@ -260,6 +289,8 @@ int main(int argc, const char *argv[]) {
             save = argv[++i];
         } else if (strcmp(argv[i], "--no-save") == 0) {
             no_save = 1;
+        } else if (strcmp(argv[i], "--wav") == 0 && i + 1 < argc) {
+            wav = argv[++i];
         } else if (strcmp(argv[i], "--headless") == 0) {
             headless = 1;
         } else if (strcmp(argv[i], "--no-sleep") == 0) {
@@ -288,11 +319,6 @@ int main(int argc, const char *argv[]) {
         print_usage();
         return 1;
     }
-    if (frames == 0) {
-        fprintf(stderr, "error: --frames must be at least 1\n");
-        return 1;
-    }
-
     emulator_init(&emu);
 
     if (bios) {
@@ -331,13 +357,30 @@ int main(int argc, const char *argv[]) {
 
     printf("Loaded '%s' (%u bytes)\n", rom, emu.mem.rom_size);
     printf("BIOS: %s\n", emu.has_bios ? bios : "built-in (high level emulation)");
-    printf("Running %u frame(s), %s input\n\n", frames,
-           input_available ? "keyboard" : "none");
+    if (frames) {
+        printf("Running %u frame(s), %s input\n\n", frames,
+               input_available ? "keyboard" : "none");
+    } else {
+        printf("Running until you quit (Ctrl-C or Q), %s input\n\n",
+               input_available ? "keyboard" : "none");
+    }
 
     int preview = !headless && isatty(STDOUT_FILENO);
     if (preview) {
         if (scale == 0) scale = detect_scale();
         fputs("\x1b[2J", stdout);
+    }
+
+    FILE *wavf = NULL;
+    uint32_t wav_frames = 0;
+    if (wav) {
+        wavf = strcmp(wav, "-") == 0 ? stdout : fopen(wav, "wb");
+        if (!wavf) {
+            fprintf(stderr, "error: could not open '%s' for writing\n", wav);
+            emulator_free(&emu);
+            return 1;
+        }
+        wav_write_header(wavf, 0);
     }
 
     double start = now_seconds();
@@ -346,8 +389,15 @@ int main(int argc, const char *argv[]) {
     uint32_t stuck_frames = 0;
     uint32_t last_pc = emu.cpu.reg[15];
 
-    for (f = 0; f < frames && !g_quit; f++) {
+    for (f = 0; (frames == 0 || f < frames) && !g_quit; f++) {
         emulator_frame(&emu);
+
+        if (wavf) {
+            int16_t buf[2048];
+            uint32_t got = emulator_audio_read(&emu, buf, 2048 / 2);
+            fwrite(buf, sizeof(int16_t) * 2, got, wavf);
+            wav_frames += got;
+        }
 
         input_poll(&emu.hw);
 
@@ -383,6 +433,20 @@ int main(int argc, const char *argv[]) {
 
     double elapsed = now_seconds() - start;
     if (elapsed < 1e-6) elapsed = 1e-6;
+
+    if (wavf) {
+        if (wavf != stdout) {
+            /* Patch the RIFF/data sizes now that the length is known. */
+            fflush(wavf);
+            if (fseek(wavf, 0, SEEK_SET) == 0) {
+                wav_write_header(wavf, wav_frames);
+            }
+            fclose(wavf);
+        } else {
+            fflush(stdout);
+        }
+        printf("Wrote %u audio sample(s) to %s\n", wav_frames, wav);
+    }
 
     if (dump) {
         if (!write_ppm(dump, emu.ppu.frame)) {

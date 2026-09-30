@@ -90,14 +90,23 @@ static void hle_irq_dispatch(Emulator *emu) {
 
 /* Run the CPU for approximately `cycles` machine cycles, then advance the
  * timers and service interrupts. Steps past the target, never under-runs. */
+/* Run at least `cycles` CPU cycles.  Instructions straddle slice boundaries, so
+ * the overrun is carried into the next call and hw_tick() accounts for every
+ * cycle exactly once. */
 static void run_cpu(Emulator *emu, uint32_t cycles) {
+    uint32_t target = cycles + emu->cycle_carry;
     uint32_t acc = 0;
+    uint32_t ticked = 0;
 
-    while (acc < cycles) {
+    emu->cycle_carry = 0;
+
+    while (acc < target) {
         if (emu->cpu.halted) {
             /* A stopped CPU still consumes cycles, and wakes up when the
-             * condition it is waiting for becomes true. */
-            uint32_t chunk = cycles - acc;
+             * condition it is waiting for becomes true.  These cycles are
+             * ticked here so that the timers it may be waiting on, and the
+             * sound engine, keep running while it is stopped. */
+            uint32_t chunk = target - acc;
             if (chunk > IDLE_CHUNK) {
                 chunk = IDLE_CHUNK;
             }
@@ -107,6 +116,7 @@ static void run_cpu(Emulator *emu, uint32_t cycles) {
             }
             acc += chunk;
             hw_tick(&emu->hw, chunk);
+            ticked += chunk;
             continue;
         }
 
@@ -124,8 +134,13 @@ static void run_cpu(Emulator *emu, uint32_t cycles) {
         }
     }
 
-    if (acc > cycles) {
-        hw_tick(&emu->hw, acc - cycles);
+    /* Cycles a halted CPU did not consume are advanced here, so every cycle
+     * of every slice is handed to the hardware exactly once. */
+    hw_tick(&emu->hw, target - ticked);
+
+    /* Unused cycles are carried into the next slice rather than dropped. */
+    if (acc > target) {
+        emu->cycle_carry = acc - target;
     }
 
     if (hw_irq_pending(&emu->hw) && irq_takeable(emu)) {
@@ -136,8 +151,24 @@ static void run_cpu(Emulator *emu, uint32_t cycles) {
     }
 }
 
-/* Detect rising edges of the enabled DISPSTAT interrupt conditions and map
- * them onto IF bits plus the corresponding DMA start conditions. */
+/* An HBlank or VBlank DMA is clocked by the blanking period itself, not by
+ * the matching DISPSTAT interrupt enable, so a game can stream audio without
+ * ever asking for the HBlank interrupt.  The status bits in DISPSTAT reflect
+ * the period whether or not the enable bit is set. */
+static void dma_period_sync(Emulator *emu) {
+    uint16_t stat = emu->ppu.dispstat;
+    uint16_t rise = stat & (uint16_t)~emu->prev_ppu_period;
+    emu->prev_ppu_period = stat;
+
+    if (rise & 2u) {
+        hw_dma_on_event(&emu->hw, HW_DMA_HBLANK);
+    }
+    if (rise & 1u) {
+        hw_dma_on_event(&emu->hw, HW_DMA_VBLANK);
+    }
+}
+
+/* Turn the PPU's interrupt conditions into IF bits. */
 static void dispstat_sync(Emulator *emu) {
     uint16_t now = ppu_irq_flags(&emu->ppu);
     uint16_t rise = now & (uint16_t)~emu->prev_ppu_irq;
@@ -145,11 +176,9 @@ static void dispstat_sync(Emulator *emu) {
 
     if (rise & 1u) {
         hw_raise_irq(&emu->hw, HW_IRQ_VBLANK);
-        hw_dma_on_event(&emu->hw, HW_DMA_VBLANK);
     }
     if (rise & 2u) {
         hw_raise_irq(&emu->hw, HW_IRQ_HBLANK);
-        hw_dma_on_event(&emu->hw, HW_DMA_HBLANK);
     }
     if (rise & 4u) {
         hw_raise_irq(&emu->hw, HW_IRQ_VCOUNT);
@@ -169,6 +198,7 @@ void emulator_frame(Emulator *emu) {
         }
 
         dispstat_sync(emu);
+        dma_period_sync(emu);
 
         if (y < 160) {
             ppu_render_scanline(&emu->ppu, y);
@@ -178,11 +208,13 @@ void emulator_frame(Emulator *emu) {
 
         ppu_set_hblank(&emu->ppu, 1);
         dispstat_sync(emu);
+        dma_period_sync(emu);
 
         run_cpu(emu, HBLANK_CYCLES);
 
         ppu_set_hblank(&emu->ppu, 0);
         dispstat_sync(emu);
+        dma_period_sync(emu);
     }
 
     emu->frames++;
@@ -202,7 +234,7 @@ void emulator_swi(void *ctx, uint32_t number) {
         cpu->r14[BANK_SVC] = cpu->reg[15] - (thumb ? 2u : 4u);
         cpu->spsr[BANK_SVC] = cpu->cpsr;
         cpu->cpsr = (cpu->cpsr & ~(0x1Fu | FLAG_T)) | MODE_SVC | FLAG_I;
-        cpu->reg[15] = 0x00000008;
+        cpu_set_pc(cpu, 0x00000008u);
         return;
     }
 
@@ -257,6 +289,7 @@ void emulator_reset(Emulator *emu) {
     hw_reset(&emu->hw);
     emu->frames = 0;
     emu->prev_ppu_irq = 0;
+    emu->cycle_carry = 0;
 
     /* CPU is in SVC mode after reset: write the banked stack pointer. */
     cpu_write_reg(&emu->cpu, 13, GBA_STACK_INIT);
@@ -266,6 +299,10 @@ void emulator_reset(Emulator *emu) {
     emu->cpu.reg[15] = emu->has_bios ? 0x00000000u : GBA_ROM_ENTRY;
     emu->cpu.swi_hook = emulator_swi;
     emu->cpu.swi_ctx = emu;
+}
+
+uint32_t emulator_audio_read(Emulator *emu, int16_t *out, uint32_t frames) {
+    return sound_read(&emu->hw.sound, out, frames);
 }
 
 /* A halted CPU is waiting for an interrupt, which is a normal state, so the

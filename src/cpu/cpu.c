@@ -392,19 +392,10 @@ uint32_t i = (insn >> 22) & 1; /* 1=imm offset, 0=register offset */
     uint32_t addr;
 
     if (i) {
-        /* The immediate offset is a byte offset, not an element count:
-         * LDRSB uses the whole 12 bit field and LDRSH uses sh:imm4L, while
-         * LDRH/STRH keep it in imm4L and only pick up the ARMv4 sh field
-         * when bits 11..8 are encoded as "1 sh 0". */
-        uint32_t imm12 = ((insn >> 8) & 0xF) << 4 | (insn & 0xF);
-        if (width == 1 || sign) {
-            offset = imm12;
-        } else {
-            offset = (insn & 0xF);
-            if ((insn & 0x900) == 0x900) {
-                offset = (insn & 0xF) << ((insn >> 7) & 0x3);
-            }
-        }
+        /* The immediate is the flat 8 bit imm4H:imm4L field, a byte offset
+         * for LDRH/STRH, LDRSB and LDRSH alike. There is no scaled form on
+         * this architecture: an offset of 0x10 is imm4H=1, imm4L=0. */
+        offset = (((insn >> 8) & 0xF) << 4) | (insn & 0xF);
     } else {
         offset = cpu_read_reg(cpu, insn & 0xF);
     }
@@ -550,19 +541,26 @@ static void multiply(CPU *cpu, uint32_t insn) {
     uint32_t rs = (insn >> 8) & 0xF;
     uint32_t rm = insn & 0xF;
 
-    if (insn & (1 << 22)) {
-        /* Long multiply: signed-ness in bit 23, accumulate in bit 21. */
-        int us = (insn >> 23) & 1;
-        uint64_t m = cpu_read_reg(cpu, rm);
-        uint64_t s2 = cpu_read_reg(cpu, rs);
+    if (insn & (1 << 23)) {
+        /* Long multiply (UMULL/SMULL/UMLAL/SMLAL). Bit 23 marks the long
+         * form; bit 22 selects signed (1) or unsigned (0). The source
+         * operands sit in the opposite fields from the 32-bit form:
+         * Rm is in bits 11-8 and Rs is in bits 3-0. */
+        int us = (insn >> 22) & 1;
+        uint32_t rm_long = rs;   /* bits 11-8 */
+        uint32_t rs_long = rm;   /* bits 3-0  */
+        uint64_t m = cpu_read_reg(cpu, rm_long);
+        uint64_t s2 = cpu_read_reg(cpu, rs_long);
         uint64_t product;
         if (us) {
-            product = (uint64_t)(int64_t)(int32_t)m * (uint64_t)(int64_t)(int32_t)s2;
+            product = (uint64_t)((int64_t)(int32_t)m * (int64_t)(int32_t)s2);
         } else {
             product = m * s2;
         }
         if (a) {
-            product += cpu_read_reg(cpu, rn);
+            /* The 64-bit accumulator is RdHi:RdLo, i.e. {rd, rn}. */
+            product += ((uint64_t)cpu_read_reg(cpu, rd) << 32) |
+                       cpu_read_reg(cpu, rn);
         }
         cpu_write_reg(cpu, rd, (uint32_t)(product >> 32));
         cpu_write_reg(cpu, rn, (uint32_t)product);

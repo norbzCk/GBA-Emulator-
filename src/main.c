@@ -1,4 +1,5 @@
 #include <stdio.h>
+#include <string.h>
 
 #include "cpu/cpu.h"
 #include "cpu/bios.h"
@@ -72,6 +73,14 @@ static void run_thumb(CPU *cpu, Memory *mem, uint32_t addr, uint16_t insn) {
 }
 
 /* ---- BIOS services ------------------------------------------------------- */
+
+/* Stands in for emulator_swi: with no BIOS image mapped an SWI is serviced
+ * in C. Reaching that handler only needs the memory and the hardware, both
+ * of which the hardware block already holds on to. */
+static void test_swi_hook(void *ctx, uint32_t number) {
+    HW *hw = ctx;
+    bios_swi(hw->mem, hw->cpu, hw, number);
+}
 
 static void test_bios_services(void) {
     Memory memory;
@@ -262,11 +271,147 @@ static void test_bios_services(void) {
 
     t_check("SWI returns to the caller", cpu.reg[15] == 0x08000040u);
 
+    /* --- SoftReset ---
+     * SWI 0x00 must land in the cartridge entry point. The step loop
+     * overwrites R15 with the next sequential address unless the PC was
+     * flagged as written, so a plain register store here is undone the
+     * moment the SWI returns and the reset jumps nowhere. */
+    {
+        static uint8_t rom[0x200];
+        CPU    soft;
+        Memory smem;
+        memory_init(&smem);
+        memory_load_rom_data(&smem, rom, sizeof(rom));
+        cpu_init(&soft);
+        /* Route the SWI to the same HLE path the emulator installs. */
+        soft.swi_hook = test_swi_hook;
+        soft.swi_ctx  = &hw;
+        memory_set_io(&smem, &hw);
+        /* The hook works off hw->cpu, so point it at the CPU under test. */
+        hw.cpu = &soft;
+        hw.mem = &smem;
+        soft.cpsr = MODE_USR;
+        soft.reg[15] = 0x08000040u;
+        memory_write32(&smem, 0x08000040u, 0xEF000000u); /* SWI 0 */
+        cpu_step(&soft, &smem);
+        t_check("SoftReset reaches the cartridge entry point",
+                soft.reg[15] == 0x08000000u);
+        t_check("SoftReset leaves ARM state", (soft.cpsr & FLAG_T) == 0);
+        t_check("SoftReset points the stack at the top of IWRAM",
+                cpu_read_reg(&soft, 13) == 0x03007F00u);
+        /* A sequential step after the reset must not disturb the PC. */
+        memory_write32(&smem, 0x08000000u, 0xE1A00000u); /* MOV r0, r0 */
+        cpu_step(&soft, &smem);
+        t_check("SoftReset PC survives the next step",
+                soft.reg[15] == 0x08000004u);
+        memory_set_io(&smem, NULL);
+        memory_free(&smem);
+    }
+
+    /* --- SWI into a real BIOS image ---
+     * With an image mapped the SWI has to vector to 0x08 and let the BIOS
+     * code run, rather than jumping to the next instruction. */
+    {
+        Emulator emu;
+        emulator_init(&emu);
+        static uint8_t rom[0x200];
+        memory_load_rom_data(&emu.mem, rom, sizeof(rom));
+        emu.has_bios = 1;
+        cpu_init(&emu.cpu);
+        emu.cpu.cpsr = MODE_USR;
+        emu.cpu.reg[15] = 0x08000040u;
+        /* The BIOS entry at 0x08 is left as zeros, so the CPU falls
+         * straight through it; what matters is the vector. */
+        emulator_swi(&emu, 0x00);
+        t_check("A mapped BIOS vectors SWI to 0x08",
+                emu.cpu.reg[15] == 0x00000008u);
+        t_check("A mapped BIOS switches to SVC", (emu.cpu.cpsr & 0x1F) == MODE_SVC);
+        t_check("A mapped BIOS stores the return address in SVC LR",
+                emu.cpu.r14[BANK_SVC] == 0x0800003Cu);
+        emulator_free(&emu);
+    }
+
     memory_set_io(&memory, NULL);
     memory_free(&memory);
 }
 
 /* ---- end to end ---------------------------------------------------------- */
+
+/* ---- long multiply (UMULL/SMULL/UMLAL/SMLAL) ----------------------------- */
+
+/* Run a 64-bit multiply and return the result as {high, low}. In the ARMv4T
+ * long-multiply encoding RdLo is in bits 15-12, RdHi in bits 19-16, Rm in
+ * bits 11-8 and Rs in bits 3-0 -- the source operands sit in the opposite
+ * fields from the 32-bit form. */
+static void run_long_mult(CPU *cpu, Memory *mem, uint32_t insn,
+                          uint32_t rdlo, uint32_t rdhi,
+                          uint32_t rm, uint32_t rs,
+                          uint32_t *hi, uint32_t *lo) {
+    unsigned lo_idx = (insn >> 12) & 0xF;
+    unsigned hi_idx = (insn >> 16) & 0xF;
+
+    cpu_init(cpu);
+    memory_write32(mem, 0x03000000, insn);
+    memory_write32(mem, 0x03000004, 0xEAFFFFFE);   /* b . */
+    cpu_write_reg(cpu, lo_idx, rdlo);
+    cpu_write_reg(cpu, hi_idx, rdhi);
+    cpu_write_reg(cpu, (insn >> 8) & 0xF, rm);
+    cpu_write_reg(cpu, insn & 0xF, rs);
+    cpu->cpsr |= FLAG_I | FLAG_F;
+    cpu->cpsr &= ~FLAG_T;
+    cpu->reg[15] = 0x03000000;
+    cpu_step(cpu, mem);
+
+    *lo = cpu_read_reg(cpu, lo_idx);
+    *hi = cpu_read_reg(cpu, hi_idx);
+}
+
+static void test_long_multiply(Memory *memory) {
+    CPU cpu;
+    uint32_t hi, lo;
+
+    printf("=== 64-bit multiply ===\n");
+
+    /* UMULL r0, r1, r2, r3 with r2=3, r3=7 -> 21. */
+    run_long_mult(&cpu, memory, 0xE0810392, 0, 0, 3, 7, &hi, &lo);
+    t_check("UMULL produces the full 64-bit product", lo == 21 && hi == 0);
+    t_check("UMULL writes the low word to RdLo", cpu_read_reg(&cpu, 0) == 21);
+    t_check("UMULL writes the high word to RdHi", cpu_read_reg(&cpu, 1) == 0);
+
+    /* The high word must not be forced to zero. */
+    run_long_mult(&cpu, memory, 0xE0810392, 0, 0, 0x10000, 0x10000, &hi, &lo);
+    t_check("UMULL fills the high word when it overflows 32 bits",
+            lo == 0 && hi == 1);
+
+    /* SMULL r0, r1, r2, r3 with r2=3, r3=-7 -> -21. */
+    run_long_mult(&cpu, memory, 0xE0C10392, 0, 0, 3, 0xFFFFFFF9u, &hi, &lo);
+    t_check("SMULL sign extends both operands",
+            lo == 0xFFFFFFEB && hi == 0xFFFFFFFFu);
+
+    /* UMLAL accumulates into the full RdHi:RdLo pair, not just RdLo. */
+    run_long_mult(&cpu, memory, 0xE0A10392, 5, 0, 3, 7, &hi, &lo);
+    t_check("UMLAL adds the product to the low accumulator", lo == 26 && hi == 0);
+    run_long_mult(&cpu, memory, 0xE0A10392, 0, 7, 3, 7, &hi, &lo);
+    t_check("UMLAL adds the product to the high accumulator too",
+            lo == 21 && hi == 7);
+
+    /* SMLAL accumulates a negative product. */
+    run_long_mult(&cpu, memory, 0xE0E10392, 5, 0xFFFFFFFFu, 3, 0xFFFFFFF9u,
+                  &hi, &lo);
+    t_check("SMLAL accumulates into a negative 64-bit value",
+            lo == 0xFFFFFFF0 && hi == 0xFFFFFFFEu);
+
+    /* The S variants set flags from the 64-bit result. */
+    run_long_mult(&cpu, memory, 0xE0910392, 0, 0, 0, 0, &hi, &lo);
+    t_check("UMULLS sets Z when the 64-bit result is zero",
+            (cpu.cpsr & FLAG_Z) != 0);
+    t_check("UMULLS leaves N clear for a zero result",
+            (cpu.cpsr & FLAG_N) == 0);
+
+    run_long_mult(&cpu, memory, 0xE0D10392, 0, 0, 0, 0, &hi, &lo);
+    t_check("SMULLS sets Z when the 64-bit result is zero",
+            (cpu.cpsr & FLAG_Z) != 0);
+}
 
 static void test_boot_rom(void) {
     static uint8_t rom[TEST_ROM_SIZE];
@@ -313,6 +458,729 @@ static void test_boot_rom(void) {
                 == test_rom_expected_color((239u + 159u) & 0xFFu));
 
     emulator_free(&emu);
+}
+
+/* ---- sound ---------------------------------------------------------------- */
+
+/* Drive the sound engine directly so the tests do not depend on a game.
+ * The ring buffer is finite, so the engine is advanced in small steps and
+ * drained as it goes. */
+/* Advance `cycles` of CPU time in 512 cycle sample steps, draining the ring
+ * between steps.  Returns the number of sample frames produced. */
+static uint32_t snd_run(Sound *s, uint64_t cycles, int16_t *peak) {
+    int16_t buf[4096];
+    uint32_t total = 0;
+    int16_t running = 0;
+
+    for (uint64_t c = 512u; c <= cycles; c += 512u) {
+        uint32_t n;
+        sound_tick(s, c);
+        while ((n = sound_read(s, buf, 2048)) > 0) {
+            for (uint32_t i = 0; i < n * 2; i++) {
+                int16_t v = buf[i] < 0 ? (int16_t)-buf[i] : buf[i];
+                if (v > running) running = v;
+            }
+            total += n;
+        }
+    }
+    *peak = running;
+    return total;
+}
+
+static int16_t snd_peak(Sound *s, uint64_t cycles) {
+    int16_t peak;
+    (void)snd_run(s, cycles, &peak);
+    return peak;
+}
+
+/* Peak level of the left and right outputs separately. */
+static void snd_peaks(Sound *s, uint64_t cycles, int16_t *left, int16_t *right) {
+    int16_t buf[4096];
+    uint16_t l = 0, r = 0;
+
+    for (uint64_t c = 512u; c <= cycles; c += 512u) {
+        uint32_t n;
+        sound_tick(s, c);
+        while ((n = sound_read(s, buf, 2048)) > 0) {
+            for (uint32_t i = 0; i < n; i++) {
+                int16_t vl = buf[i * 2] < 0 ? (int16_t)-buf[i * 2] : buf[i * 2];
+                int16_t vr = buf[i * 2 + 1] < 0 ? (int16_t)-buf[i * 2 + 1] : buf[i * 2 + 1];
+                if (vl > l) l = vl;
+                if (vr > r) r = vr;
+            }
+        }
+    }
+    *left = (int16_t)l;
+    *right = (int16_t)r;
+}
+
+static void test_sound(void) {
+    Sound  s;
+    int16_t peak = 0;
+
+    printf("=== Sound (PSG + DirectSound) ===\n");
+
+    /* A 50% duty square wave on channel 1 at full volume, frequency 0x600.
+     * GBATEK: SOUND1CNT_H bits 0-5 are the length, 6-7 the duty, 12-15 the
+     * initial volume; SOUND1CNT_X bits 0-10 the frequency, 14 the length
+     * flag and 15 the restart trigger. */
+#define SND_SQUARE(s_, x_) do {                                       \
+        sound_write16(&(s_), 0x4000060u, 0x0000u); /* no sweep */      \
+        sound_write16(&(s_), 0x4000062u, 0xF080u); /* vol 15, 50% */   \
+        sound_write16(&(s_), 0x4000064u, (x_));    /* freq + restart */\
+    } while (0)
+#define SND_ENABLE_ALL(s_) do {                                       \
+        sound_write16(&(s_), 0x4000080u, 0x7777u); /* PSG vol 7+7, all */\
+        sound_write16(&(s_), 0x4000082u, 0x0002u); /* PSG at 100% */   \
+        sound_write16(&(s_), 0x4000084u, 0x0080u); /* master enable */ \
+    } while (0)
+
+    /* The mixer samples once every 512 CPU cycles. */
+    sound_init(&s);
+    t_check("the mixer samples once every 512 CPU cycles",
+            s.frac_step == 128u && EMULATOR_AUDIO_RATE == 32768u);
+
+    /* One second of CPU time is 16777216 cycles, which is 32768 samples. */
+    sound_init(&s);
+    t_check("one second of CPU time yields 32768 sample frames",
+            snd_run(&s, 16777216u, &peak) == 32768u);
+
+    /* SOUNDBIAS powers up at 0x200, so an idle mixer is exactly zero. */
+    sound_init(&s);
+    t_check("SOUNDBIAS defaults to 0x200 so silence is zero",
+            s.bias == 0x200 && snd_peak(&s, 16777216u) == 0);
+
+    /* SOUND_CNT_X bit 7 gates everything the mixer emits. */
+    sound_init(&s);
+    sound_write16(&s, 0x4000080u, 0x7777u);
+    sound_write16(&s, 0x4000082u, 0x0002u);
+    SND_SQUARE(s, 0x8600u);
+    sound_write16(&s, 0x4000084u, 0x0000u);
+    t_check("SOUND_CNT_X bit 7 gates the output", snd_peak(&s, 16777216u) == 0);
+
+    sound_init(&s);
+    sound_write16(&s, 0x4000080u, 0x7777u);
+    sound_write16(&s, 0x4000082u, 0x0002u);
+    SND_SQUARE(s, 0x8600u);
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    t_check("an enabled square wave is audible", snd_peak(&s, 16777216u) > 0);
+
+    /* Clearing the master enable also zeroes the PSG registers. */
+    sound_init(&s);
+    sound_write16(&s, 0x4000080u, 0x7777u);
+    SND_SQUARE(s, 0x8600u);
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    sound_write16(&s, 0x4000084u, 0x0000u);
+    t_check("clearing SOUND_CNT_X bit 7 resets the PSG registers",
+            s.reg[0x00] == 0 && s.reg[0x02] == 0 && s.reg[0x10] == 0
+                && !s.ch[0].on);
+
+    /* SOUNDCNT_L bits 8-15 gate each channel on the right and the left. */
+    {
+        int16_t l, r;
+
+        sound_init(&s);
+        sound_write16(&s, 0x4000080u, 0x0701u); /* right ch1 only */
+        sound_write16(&s, 0x4000082u, 0x0002u);
+        SND_SQUARE(s, 0x8600u);
+        sound_write16(&s, 0x4000084u, 0x0080u);
+        snd_peaks(&s, 262144u, &l, &r);
+        t_check("SOUNDCNT_L bits 8-15 route each channel to one side",
+                l == 0 && r > 0);
+
+        sound_init(&s);
+        sound_write16(&s, 0x4000080u, 0x7777u); /* every channel, both sides */
+        sound_write16(&s, 0x4000082u, 0x0002u);
+        SND_SQUARE(s, 0x8600u);
+        sound_write16(&s, 0x4000084u, 0x0080u);
+        snd_peaks(&s, 262144u, &l, &r);
+        t_check("enabling a channel on both sides feeds both outputs", l > 0 && r > 0);
+    }
+
+    /* SOUNDCNT_L bits 0-2 and 4-6 are the PSG master volume. */
+    {
+        int16_t l1, r1, l2, r2;
+
+        sound_init(&s);
+        sound_write16(&s, 0x4000080u, 0x7707u); /* both sides, right volume 7 */
+        sound_write16(&s, 0x4000082u, 0x0002u);
+        SND_SQUARE(s, 0x8600u);
+        sound_write16(&s, 0x4000084u, 0x0080u);
+        snd_peaks(&s, 262144u, &l1, &r1);
+
+        sound_init(&s);
+        sound_write16(&s, 0x4000080u, 0x7700u); /* right volume 0 */
+        sound_write16(&s, 0x4000082u, 0x0002u);
+        SND_SQUARE(s, 0x8600u);
+        sound_write16(&s, 0x4000084u, 0x0080u);
+        snd_peaks(&s, 262144u, &l2, &r2);
+
+        t_check("SOUNDCNT_L bits 0-2 scale the right PSG volume",
+                r1 > r2 && r2 > 0);
+        t_check("SOUNDCNT_L bits 4-6 leave the left side alone",
+                l1 == l2 && l1 > 0);
+    }
+
+    /* SOUNDCNT_H bits 0-1 pick 25%, 50% or 100% for the whole PSG. */
+    {
+        int16_t full, quarter;
+
+        sound_init(&s);
+        sound_write16(&s, 0x4000080u, 0x7777u);
+        sound_write16(&s, 0x4000082u, 0x0002u); /* 100% */
+        SND_SQUARE(s, 0x8600u);
+        sound_write16(&s, 0x4000084u, 0x0080u);
+        full = snd_peak(&s, 16777216u);
+
+        sound_init(&s);
+        sound_write16(&s, 0x4000080u, 0x7777u);
+        sound_write16(&s, 0x4000082u, 0x0000u); /* 25% */
+        SND_SQUARE(s, 0x8600u);
+        sound_write16(&s, 0x4000084u, 0x0080u);
+        quarter = snd_peak(&s, 16777216u);
+
+        t_check("SOUNDCNT_H bits 0-1 scale the PSG (100% louder than 25%)",
+                full > quarter && quarter > 0);
+    }
+
+    /* The length counter only runs when SOUNDxCNT_X bit 14 is set. */
+    sound_init(&s);
+    sound_write16(&s, 0x4000080u, 0x7777u);
+    sound_write16(&s, 0x4000082u, 0x0002u);
+    SND_SQUARE(s, 0x8600u);                  /* bit 14 clear */
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    (void)snd_peak(&s, 16777216u);
+    t_check("a channel with the length flag off keeps playing",
+            s.ch[0].on && !s.ch[0].length_enable);
+
+    sound_init(&s);
+    sound_write16(&s, 0x4000080u, 0x7777u);
+    sound_write16(&s, 0x4000082u, 0x0002u);
+    sound_write16(&s, 0x4000060u, 0x0000u);  /* no sweep */
+    sound_write16(&s, 0x4000062u, 0xF080u);  /* length 0, vol 15, 50% duty */
+    sound_write16(&s, 0x4000064u, 0xC600u);  /* length flag + restart */
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    (void)snd_peak(&s, 16777216u);
+    t_check("the length counter stops a length-enabled channel", !s.ch[0].on);
+
+    /* The envelope counts down the initial volume. */
+    sound_init(&s);
+    sound_write16(&s, 0x4000080u, 0x7777u);
+    sound_write16(&s, 0x4000082u, 0x0002u);
+    sound_write16(&s, 0x4000060u, 0x0000u);
+    sound_write16(&s, 0x4000062u, 0xF108u);  /* step 1, decreasing, vol 15 */
+    sound_write16(&s, 0x4000064u, 0x8600u);
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    t_check("the initial volume is 15", s.ch[0].volume == 15);
+    (void)snd_peak(&s, 16777216u);
+    t_check("a decreasing envelope runs the volume to zero",
+            s.ch[0].volume == 0 && snd_peak(&s, 65536u) == 0);
+
+    /* The wave channel plays the nibbles in wave RAM, two banks selectable. */
+    sound_init(&s);
+    for (int i = 0; i < 16; i++) {
+        s.wave[i] = (uint8_t)(i * 2);
+        s.wave[i + 16] = (uint8_t)(15 - i);
+    }
+    sound_write16(&s, 0x4000080u, 0x7777u);
+    sound_write16(&s, 0x4000082u, 0x0002u);
+    sound_write16(&s, 0x4000070u, 0x0080u);  /* channel 3 playback on */
+    sound_write16(&s, 0x4000072u, 0x2000u);  /* 100% volume */
+    sound_write16(&s, 0x4000074u, 0x8000u);  /* restart, sample rate 0 */
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    t_check("wave channel 3 plays wave RAM", snd_peak(&s, 16777216u) > 0);
+
+    /* SOUND3CNT_L bit 7 stops channel 3. */
+    sound_write16(&s, 0x4000070u, 0x0000u);
+    t_check("SOUND3CNT_L bit 7 stops the wave channel", !s.ch[2].on);
+
+    /* The noise channel's LFSR shifts as its timer fires. */
+    sound_init(&s);
+    sound_write16(&s, 0x4000080u, 0x7777u);
+    sound_write16(&s, 0x4000082u, 0x0002u);
+    sound_write16(&s, 0x4000078u, 0xF000u);  /* vol 15 */
+    sound_write16(&s, 0x400007Cu, 0x8000u);  /* restart */
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    t_check("the noise LFSR powers up as all ones", s.ch[3].lfsr == 0x7FFFu);
+    (void)snd_peak(&s, 16777216u);
+    t_check("the noise channel is audible and its LFSR moves",
+            s.ch[3].lfsr != 0x7FFFu);
+
+    /* DirectSound: an 8 bit stream in FIFO A reaches the mixer. */
+    sound_init(&s);
+    for (int i = 0; i < 32; i++) {
+        s.fifo[0][i] = (int8_t)(i < 16 ? 0xC0 : 0x40);
+    }
+    s.fifo_count[0] = 32;
+    s.fifo_next[0] = 0;
+    s.fifo_timer[0] = 1024; /* TM0 clocking the FIFO */
+    sound_write16(&s, 0x4000080u, 0x7000u);
+    sound_write16(&s, 0x4000082u, 0x0002u | 0x0200u); /* PSG 100%, FIFO A left */
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    t_check("DirectSound FIFO A reaches the mixer", snd_peak(&s, 16777216u) > 0);
+    t_check("the FIFO is consumed as the timer fires", s.fifo_count[0] < 32u);
+
+    /* A FIFO that is routed nowhere stays silent. */
+    sound_init(&s);
+    for (int i = 0; i < 32; i++) {
+        s.fifo[0][i] = (int8_t)0xC0;
+    }
+    s.fifo_count[0] = 32;
+    s.fifo_next[0] = 0;
+    s.fifo_timer[0] = 1024;
+    sound_write16(&s, 0x4000080u, 0x7000u);
+    sound_write16(&s, 0x4000082u, 0x0002u);  /* no FIFO routing at all */
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    t_check("an unrouted FIFO is silent", snd_peak(&s, 16777216u) == 0);
+
+    /* SOUNDCNT_H bits 8-15 route FIFO A, and bit 11 resets it. */
+    sound_init(&s);
+    for (int i = 0; i < 8; i++) {
+        sound_write16(&s, 0x40000A0u, 0xC000u);
+    }
+    sound_write16(&s, 0x4000082u, 0x0100u);  /* FIFO A right */
+    t_check("SOUNDCNT_H bit 8 routes FIFO A to the right", s.dma_right[0]);
+    sound_write16(&s, 0x4000082u, 0x0800u);  /* reset FIFO A */
+    t_check("SOUNDCNT_H bit 11 resets FIFO A",
+            s.fifo_count[0] == 0 && s.fifo_head[0] == 0);
+    sound_write16(&s, 0x4000082u, 0x4000u);  /* FIFO B uses timer 1 */
+    t_check("SOUNDCNT_H bit 14 selects timer 1 for FIFO B", s.dma_timer[1] == 1);
+
+    /* Word writes into the FIFO feed it, and the FIFO is 32 words deep. */
+    sound_init(&s);
+    for (int i = 0; i < 40; i++) {
+        sound_write16(&s, 0x40000A0u, (uint16_t)(i < 16 ? 0xC000u : 0x4000u));
+    }
+    t_check("the FIFO holds at most 32 words", s.fifo_count[0] == 32);
+
+    /* A 32 bit FIFO word is four samples, least significant byte first. */
+    sound_init(&s);
+    sound_write32(&s, 0x40000A0u, 0x44332211u);
+    t_check("a 32 bit FIFO A write pushes four samples, LSB first",
+            s.fifo_count[0] == 4u
+                && s.fifo[0][0] == 0x11 && s.fifo[0][1] == 0x22
+                && s.fifo[0][2] == 0x33 && s.fifo[0][3] == 0x44);
+    sound_init(&s);
+    sound_write32(&s, 0x40000A4u, 0x00000080u);
+    t_check("0x040000A4 feeds the same FIFO A",
+            s.fifo_count[0] == 4u && s.fifo[0][0] == (int8_t)0x80);
+    sound_init(&s);
+    sound_write32(&s, 0x40000B0u, 0x01020304u);
+    t_check("0x040000B0 feeds FIFO B", s.fifo_count[1] == 4u && s.fifo_count[0] == 0u);
+
+    /* A stopped timer leaves the FIFO frozen. */
+    sound_init(&s);
+    sound_write32(&s, 0x40000A0u, 0x80808080u);
+    sound_write16(&s, 0x4000080u, 0x7000u);
+    sound_write16(&s, 0x4000082u, 0x0002u | 0x0200u);
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    s.fifo_timer[0] = 0; /* TM0 not running */
+    (void)snd_peak(&s, 16777216u);
+    t_check("a stopped timer never drains the FIFO", s.fifo_count[0] == 4u);
+
+    /* Registers read back what the program wrote. */
+    sound_init(&s);
+    sound_write16(&s, 0x4000060u, 0x1234u);
+    sound_write16(&s, 0x4000062u, 0x5678u);
+    sound_write16(&s, 0x4000064u, 0x9ABCu);
+    sound_write16(&s, 0x4000068u, 0x0FFFu);
+    sound_write16(&s, 0x4000080u, 0xF0AAu);
+    sound_write16(&s, 0x4000082u, 0xBB55u);
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    sound_write16(&s, 0x4000088u, 0x8C40u);
+    t_check("SOUND1CNT_L/H/X read back",
+            s.reg[0x00] == 0x1234u && s.reg[0x01] == 0x5678u
+                && s.reg[0x02] == 0x9ABCu && s.reg[0x04] == 0x0FFFu);
+    t_check("SOUNDCNT_L/H read back",
+            s.reg[0x10] == 0xF0AAu && s.reg[0x11] == 0xBB55u);
+    t_check("SOUNDBIAS 0x8C40 decodes to bias 0x020 and 7 bit output",
+            s.bias == 0x020u && s.amp_bits == 2u);
+
+    /* SOUND_CNT_X bits 0-3 report which channels are running. */
+    sound_init(&s);
+    sound_write16(&s, 0x4000084u, 0x0080u);
+    sound_write16(&s, 0x4000064u, 0x8600u);
+    {
+        uint16_t v = 0;
+        t_check("SOUND_CNT_X bit 0 reports channel 1 running",
+                sound_read16(&s, 0x4000084u, &v) && (v & 0x0001u) != 0);
+        sound_write16(&s, 0x4000064u, 0x0000u);
+    }
+    sound_write16(&s, 0x4000064u, 0xC600u);  /* length flag + restart */
+    {
+        uint16_t v = 0;
+        (void)snd_peak(&s, 16777216u);
+        t_check("SOUND_CNT_X bit 0 clears when the length expires",
+                sound_read16(&s, 0x4000084u, &v) && (v & 0x0001u) == 0);
+    }
+
+#undef SND_SQUARE
+#undef SND_ENABLE_ALL
+}
+
+/* ---- cartridge backup ---------------------------------------------------- */
+
+/* EEPROM is bit-serial but the game still writes whole bytes, and the chip
+ * consumes the eight bits of each one from the top down. An access is the
+ * address at the chip's own fixed width followed by the payload, so this sends
+ * `addr` right aligned in `addr_bits` bits and then the data byte. */
+static void eeprom_write_byte(Memory *mem, uint8_t byte) {
+    memory_write8(mem, 0x0D000000u, byte);
+}
+
+/* Send the address at the chip's own width followed by the terminating 1 bit,
+ * left aligned in whole bytes. The chip counts the trailing bits of the last
+ * byte off as padding, so nothing else is needed here. */
+static void eeprom_send_address(Memory *mem, uint32_t addr) {
+    int bits  = mem->save.addr_bits + 1;   /* address plus its terminator */
+    int bytes = (bits + 7) / 8;
+    /* The stream starts at the top of the first byte, so a width that is not
+     * a whole number of bytes leaves the terminator part way down one. */
+    uint32_t stream = ((addr << 1) | 1u) << (bytes * 8 - bits);
+
+    for (int i = 0; i < bytes; i++) {
+        eeprom_write_byte(mem, (uint8_t)(stream >> ((bytes - 1 - i) * 8)));
+    }
+}
+
+static void eeprom_write_8(Memory *mem, uint32_t addr, uint8_t data) {
+    eeprom_send_address(mem, addr);
+    eeprom_write_byte(mem, data);
+}
+
+/* Open an access for reading. The address goes out, then the chip shifts the
+ * payload back a bit at a time. */
+static void eeprom_select(Memory *mem, uint32_t addr) {
+    eeprom_send_address(mem, addr);
+}
+
+/* Read `count` payload bits, one per read of the same address. */
+static uint32_t eeprom_read_bits(Memory *mem, int count) {
+    uint32_t v = 0;
+    for (int i = 0; i < count; i++) {
+        v = (v << 1) | memory_read8(mem, 0x0D000000u);
+    }
+    return v;
+}
+
+static void test_cartridge_backup(void) {
+    Memory mem;
+    CPU    cpu;
+    PPU    ppu;
+    HW     hw;
+    static uint8_t rom[0x200];
+    const char *tmp = "/tmp/opencode/gba-test.sav";
+
+    printf("=== Cartridge backup tests ===\n");
+
+    memory_init(&mem);
+    cpu_init(&cpu);
+    ppu_init(&ppu, &mem);
+    hw_init(&hw, &mem, &cpu, &ppu);
+    memory_set_io(&mem, &hw);
+
+    /* --- plain SRAM --- */
+    memset(rom, 0, sizeof(rom));
+    rom[0xB2] = 0x09;                       /* 64 KB of SRAM */
+    memory_load_rom_data(&mem, rom, sizeof(rom));
+    t_check("header 09 selects SRAM", mem.save.kind == SAVE_SRAM);
+    t_check("header 09 is 64 KB", mem.save.size == 0x10000u);
+
+    memory_write8(&mem, 0x0A000000u, 0x42);
+    memory_write8(&mem, 0x0A000123u, 0x99);
+    t_check("SRAM read back", memory_read8(&mem, 0x0A000000u) == 0x42);
+    t_check("SRAM read back at an offset", memory_read8(&mem, 0x0A000123u) == 0x99);
+    /* A 16 bit store to the window has to reach both bytes. */
+    memory_write16(&mem, 0x0A000200u, 0xBEEF);
+    t_check("SRAM 16 bit store hits both bytes",
+            memory_read8(&mem, 0x0A000200u) == 0xEF &&
+            memory_read8(&mem, 0x0A000201u) == 0xBE);
+
+    memory_store_save(&mem, tmp);
+    memory_write8(&mem, 0x0A000000u, 0x00);
+    t_check("SRAM save file round trip", memory_load_save(&mem, tmp) &&
+            memory_read8(&mem, 0x0A000000u) == 0x42);
+    remove(tmp);
+
+    /* --- EEPROM ---
+     * The bit stream has no register behind it, so a byte written to
+     * 0x0D000000 does not land at an address the way SRAM does. Before this
+     * the whole window read back as open bus and every EEPROM game saw a
+     * blank save. */
+    rom[0xB2] = 0x05;                       /* 16 KB EEPROM, 14 bit address */
+    memory_load_rom_data(&mem, rom, sizeof(rom));
+    t_check("header 05 selects EEPROM", mem.save.kind == SAVE_EEPROM);
+    t_check("header 05 has a 14 bit address", mem.save.addr_bits == 14);
+
+    eeprom_write_8(&mem, 0x00, 0xA5);      /* payload 1010 0101 at address 0 */
+    t_check("EEPROM write is not plain memory",
+            mem.save.data[0] == 0xA5);
+
+    /* Read it back: address 0 again, then 8 reads. */
+    eeprom_select(&mem, 0x00);
+    t_check("EEPROM read returns the written byte",
+            eeprom_read_bits(&mem, 8) == 0xA5);
+
+    /* A second address has to land somewhere else, which is what shows the
+     * address is being parsed rather than ignored. */
+    eeprom_write_8(&mem, 0x02, 0x5C);
+    t_check("EEPROM honours a second address", mem.save.data[2] == 0x5C);
+    eeprom_select(&mem, 0x00);
+    t_check("EEPROM address 0 is unchanged", eeprom_read_bits(&mem, 8) == 0xA5);
+    eeprom_select(&mem, 0x02);
+    t_check("EEPROM address 2 reads back", eeprom_read_bits(&mem, 8) == 0x5C);
+
+    /* A cell erases to all ones and programming only ever drives bits to
+     * zero, so a later write can clear a bit but can never bring one back.
+     * That is the one behaviour a plain memory write cannot reproduce. */
+    eeprom_write_8(&mem, 0x02, 0x0F);
+    t_check("EEPROM a later write clears bits", mem.save.data[2] == 0x0C);
+    eeprom_write_8(&mem, 0x02, 0xA5);
+    t_check("EEPROM a cleared bit does not come back",
+            mem.save.data[2] == 0x04);
+    eeprom_write_8(&mem, 0x00, 0x00);
+    t_check("EEPROM an all zero payload erases the cell",
+            mem.save.data[0] == 0x00);
+
+    /* A fresh chip is erased, so an unwritten byte reads as all ones. */
+    eeprom_select(&mem, 0x40);
+    t_check("an unwritten EEPROM byte reads as all ones",
+            eeprom_read_bits(&mem, 8) == 0xFF);
+
+    memory_store_save(&mem, tmp);
+    memset(mem.save.data, 0, sizeof(mem.save.data));
+    t_check("EEPROM save file round trip", memory_load_save(&mem, tmp) &&
+            mem.save.data[0] == 0x00 && mem.save.data[2] == 0x04);
+    remove(tmp);
+
+    /* An erased load means all ones, not zeros: a zeroed EEPROM would look
+     * like a chip full of zeroes rather than a blank one. */
+    t_check("an absent EEPROM save loads erased", memory_load_save(&mem, tmp) == 0 &&
+            mem.save.data[4] == 0xFF);
+
+    /* --- Flash --- */
+    rom[0xB2] = 0x0D;                       /* 128 KB flash */
+    memory_load_rom_data(&mem, rom, sizeof(rom));
+    t_check("header 0D selects Flash", mem.save.kind == SAVE_FLASH);
+    t_check("header 0D is 128 KB", mem.save.size == 0x20000u);
+
+    /* Program a byte the way a game does: 0xAA/0x55/0xAA, then 0xA0, then
+     * the data byte at the address the 0xA0 went to. */
+    memory_write8(&mem, 0x0A000000u, 0xFF);  /* erased */
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A002AAAu, 0x55);
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A000000u, 0xA0);
+    memory_write8(&mem, 0x0A000000u, 0x5C);
+    t_check("Flash programs a byte", memory_read8(&mem, 0x0A000000u) == 0x5C);
+
+    /* Programming can only clear bits: 0xC3 over 0x5C leaves 0x40. */
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A002AAAu, 0x55);
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A000000u, 0xA0);
+    memory_write8(&mem, 0x0A000000u, 0xC3);
+    t_check("Flash programming only clears bits",
+            memory_read8(&mem, 0x0A000000u) == 0x40);
+
+    /* A chip erase puts everything back to 0xFF. */
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A002AAAu, 0x55);
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A005555u, 0x80);
+    memory_write8(&mem, 0x0A002AAAu, 0xAA);
+    memory_write8(&mem, 0x0A005555u, 0x10);
+    t_check("a Flash chip erase restores 0xFF",
+            memory_read8(&mem, 0x0A000000u) == 0xFF);
+
+    /* Identification mode is how a game tells the chip apart. */
+    memory_write8(&mem, 0x0A005555u, 0x90);
+    t_check("Flash reports a vendor id", memory_read8(&mem, 0x0A000000u) == 0x32);
+    t_check("Flash reports a device id", memory_read8(&mem, 0x0A000001u) == 0x62);
+    t_check("Flash reports a size id", memory_read8(&mem, 0x0A000002u) == 0x13);
+    memory_write8(&mem, 0x0A005555u, 0xF0);  /* back to normal reads */
+    t_check("leaving ID mode restores normal reads",
+            memory_read8(&mem, 0x0A000000u) == 0xFF);
+
+    /* A stray 0xAA must not leave the chip half unlocked, or a later single
+     * byte would be taken as a command. */
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A005555u, 0xF0);
+    t_check("an interrupted sequence is abandoned",
+            memory_read8(&mem, 0x0A000000u) == 0xFF);
+
+    /* The second 64 KB half is a separate bank. */
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A002AAAu, 0x55);
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A005555u, 0xB0);
+    memory_write8(&mem, 0x0A000000u, 0x01);
+    t_check("the bank select command switches banks", mem.save.bank == 1);
+    t_check("bank 1 is a different half of the chip",
+            memory_read8(&mem, 0x0A000000u) == 0xFF);
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A002AAAu, 0x55);
+    memory_write8(&mem, 0x0A005555u, 0xAA);
+    memory_write8(&mem, 0x0A005555u, 0xB0);
+    memory_write8(&mem, 0x0A000000u, 0x00);
+    t_check("bank select goes back to bank 0", mem.save.bank == 0);
+
+    /* --- an unreadable header ---
+     * Plenty of dumps carry a wrong backup byte, and nothing else lives in
+     * this window, so falling back to the common 8 KB EEPROM gives a working
+     * save instead of an inert one. */
+    rom[0xB2] = 0x00;
+    memory_load_rom_data(&mem, rom, sizeof(rom));
+    t_check("an unknown header falls back to EEPROM",
+            mem.save.kind == SAVE_EEPROM);
+    t_check("the fallback is 8 KB", mem.save.size == 0x2000u);
+    eeprom_write_8(&mem, 0x10, 0x77);
+    t_check("the fallback chip actually stores", mem.save.data[0x10] == 0x77);
+    eeprom_select(&mem, 0x10);
+    t_check("the fallback chip reads back", eeprom_read_bits(&mem, 8) == 0x77);
+    /* The window is claimed whichever chip the header names, so a stray byte
+     * written to it has to be consumed rather than fault, and the chip has to
+     * still work afterwards. */
+    memory_write8(&mem, 0x0A000000u, 0x11);
+    eeprom_select(&mem, 0x20);
+    t_check("the fallback chip survives a stray byte write",
+            eeprom_read_bits(&mem, 8) == 0xFF);
+
+    memory_set_io(&mem, NULL);
+    memory_free(&mem);
+}
+
+/* ---- 8bpp transparency ---------------------------------------------------- */
+
+/* Only the 4bpp forms have a transparent index. Every one of the 256 entries
+ * in an 8bpp tile or bitmap is a colour, index 0 included, so treating 0 as
+ * a hole punches transparent pixels through backgrounds and sprites that
+ * should be fully opaque.
+ *
+ * Two things make this awkward to test by colour. BG palette entry 0 doubles
+ * as the backdrop colour, so an 8bpp background's index 0 always looks like
+ * the backdrop. And every background shares one palette, so the layer
+ * underneath has to be given a palette bank of its own. With that done, the
+ * same tile is rendered twice, once 8bpp and once 4bpp, and the only
+ * difference in the result is index 0. */
+static void test_8bpp_opaque(void) {
+    Memory mem;
+    CPU    cpu;
+    PPU    ppu;
+    HW     hw;
+
+    printf("=== 8bpp index 0 is opaque ===\n");
+
+    memory_init(&mem);
+    cpu_init(&cpu);
+    ppu_init(&ppu, &mem);
+    hw_init(&hw, &mem, &cpu, &ppu);
+    memory_set_io(&mem, &hw);
+
+    /* --- 8bpp text background over a 4bpp one ---
+     * BG0 is the layer under test at priority 0, drawing a tile of all zeroes.
+     * BG1 sits under it at priority 1, solid blue, so every pixel it covers
+     * shows through wherever BG0 is transparent. */
+    memory_write16(&mem, 0x05000000, 0x001F);   /* BG0 index 0 and backdrop: red */
+    memory_write16(&mem, 0x05000002, 0x03E0);   /* BG0 index 1: green */
+    memory_write16(&mem, 0x0500003E, 0x7C00);   /* BG1 index 15 in bank 1: blue */
+
+    hw_io_write(&hw, 0x00, 0x0300, 16);         /* mode 0, BG0 and BG1 on */
+    hw_io_write(&hw, 0x08, 0x0F80, 16);         /* BG0: CBB 0, SBB 15, 8bpp, prio 0 */
+    hw_io_write(&hw, 0x0A, 0x0E05, 16);         /* BG1: CBB 1, SBB 14, 4bpp, prio 1 */
+    memory_write16(&mem, 0x06007C00, 0x0000);   /* BG0 entry (0,0): tile 0 */
+    memory_write16(&mem, 0x06007000, 0x1000);   /* BG1 entry (0,0): tile 0, palette 1 */
+    for (int i = 0; i < 8; i++) {
+        memory_write8(&mem, 0x06000000 + i, 0x00);    /* BG0 tile 0: all index 0 */
+        memory_write8(&mem, 0x06004000 + i / 2, 0xFF); /* BG1 tile 0: all index 15 */
+    }
+    ppu_render_scanline(&ppu, 0);
+    /* Every pixel is BG0 index 0. If that were treated as a hole, BG1's blue
+     * would show through instead. */
+    t_check("8bpp text background index 0 is drawn", ppu.frame[0] == 0xFF0000);
+    t_check("8bpp text background index 0 is drawn across the line",
+            ppu.frame[1] == 0xFF0000 && ppu.frame[159] == 0xFF0000);
+
+    /* The same tile as 4bpp, where index 0 is a hole. Nothing else about the
+     * setup changed, so the difference between these two renders is exactly
+     * the behaviour under test. */
+    hw_io_write(&hw, 0x08, 0x0F00, 16);          /* BG0 back to 4bpp */
+    ppu_render_scanline(&ppu, 0);
+    t_check("4bpp index 0 is still transparent", ppu.frame[0] == 0x0000FF);
+    /* The last pixel of the same tile, to catch a partial draw. Outside it
+     * the backdrop shows through both backgrounds, which is the backdrop
+     * colour again and so says nothing either way. */
+    t_check("4bpp index 0 is still transparent across the tile",
+            ppu.frame[7] == 0x0000FF);
+
+    /* A 4bpp pixel of index 1 is opaque on top of the same background. */
+    memory_write8(&mem, 0x06000000, 0x10);            /* px0: 0, px1: 1 */
+    ppu_render_scanline(&ppu, 0);
+    t_check("4bpp index 0 is still transparent next to a drawn pixel",
+            ppu.frame[0] == 0x0000FF);
+    t_check("4bpp index 1 is still drawn", ppu.frame[1] == 0x00FF00);
+
+    /* --- mode 4 indexed bitmap ---
+     * An 8bpp page of 0xA000 bytes, every entry a colour. BG2 is the only
+     * background mode 4 can use, so the backdrop is the layer underneath,
+     * and index 1 is used to tell BG2 apart from it. */
+    hw_io_write(&hw, 0x00, 0x0404, 16);          /* mode 4, BG2 on, page 0 */
+    memory_write16(&mem, 0x05000000, 0x03E0);    /* index 0 and backdrop: green */
+    memory_write16(&mem, 0x05000002, 0x001F);    /* index 1: red */
+    memset(mem.vram, 0, 0xA000);
+    memory_write8(&mem, 0x06000000, 0x01);       /* px0: index 1 */
+    ppu_render_scanline(&ppu, 0);
+    t_check("mode 4 index 1 is drawn", ppu.frame[0] == 0xFF0000);
+    /* With BG2 off the very same pixels come back as the backdrop, which is
+     * what makes the check above meaningful. */
+    hw_io_write(&hw, 0x00, 0x0004, 16);
+    ppu_render_scanline(&ppu, 0);
+    t_check("mode 4 with BG2 off falls back to the backdrop",
+            ppu.frame[0] == 0x00FF00);
+    /* Index 0 of the bitmap is the backdrop colour, so the way to show it is
+     * drawn is to turn BG2 on and see that nothing changes. */
+    memory_write8(&mem, 0x06000000, 0x00);
+    hw_io_write(&hw, 0x00, 0x0404, 16);
+    ppu_render_scanline(&ppu, 0);
+    t_check("mode 4 index 0 matches the backdrop colour",
+            ppu.frame[0] == 0x00FF00);
+    hw_io_write(&hw, 0x00, 0x0004, 16);
+    ppu_render_scanline(&ppu, 0);
+    t_check("mode 4 index 0 is the same with BG2 off",
+            ppu.frame[0] == 0x00FF00);
+
+    /* --- 8bpp object over the backdrop ---
+     * An object tile of 64 bytes holds 256 colours, so a tile that is all
+     * zeroes is a solid block, not an empty one. The object palette is
+     * separate from the BG one, so index 0 is directly comparable against
+     * the backdrop here. */
+    hw_io_write(&hw, 0x00, 0x1000, 16);          /* mode 0, OBJ on */
+    hw_io_write(&hw, 0x22, 0x003F, 16);          /* WINOUT: show everything */
+    for (int i = 0; i < 128; i++) {
+        memory_write16(&mem, 0x07000000 + 8 * i, 0x0200);   /* park off screen */
+    }
+    memory_write16(&mem, 0x05000000, 0x001F);    /* backdrop: red */
+    memory_write16(&mem, 0x05000200, 0x03E0);    /* object index 0: green */
+    for (int i = 0; i < 64; i++) {
+        memory_write8(&mem, 0x06010000 + i, 0x00);
+    }
+    memory_write16(&mem, 0x07000000, OBJ8);      /* y = 8, 8bpp, prio 0 */
+    memory_write16(&mem, 0x07000002, 0x0000);   /* 8x8 */
+    memory_write16(&mem, 0x07000004, 0x0000);   /* tile 0 */
+    ppu_render_scanline(&ppu, 0);
+    t_check("8bpp object index 0 is drawn", ppu.frame[0] == 0x00FF00);
+    t_check("the whole 8bpp tile is solid",
+            ppu.frame[1] == 0x00FF00 && ppu.frame[7] == 0x00FF00);
+
+    /* A 4bpp object of all zeroes is still empty, so the backdrop shows. */
+    memory_write16(&mem, 0x07000000, 0x0008);   /* 4bpp, y = 8 */
+    memory_write16(&mem, 0x07000004, 0x0000);
+    ppu_render_scanline(&ppu, 0);
+    t_check("4bpp object index 0 is still transparent",
+            ppu.frame[0] == 0xFF0000);
+
+    memory_set_io(&mem, NULL);
+    memory_free(&mem);
 }
 
 int main(void) {
@@ -410,6 +1278,69 @@ int main(void) {
         cpu.reg[1] = 0x02000300;
         run_one(&cpu, &memory, 0x02000090, 0xE1D100B0);
         t_check("LDRH R0 = 0x1234", cpu.reg[0] == 0x1234);
+    }
+
+    {   /* The halfword immediate is the flat 8 bit imm4H:imm4L field, so an
+         * offset of 0x10 is imm4H=1, imm4L=0 rather than something the low
+         * nibble alone could express. Decoding only imm4L silently turned
+         * every offset of 16 or more into a much smaller one. */
+        memory_write16(&memory, 0x02001000, 0x0000);
+        memory_write16(&memory, 0x02001010, 0x1111);   /* +0x10 */
+        memory_write16(&memory, 0x02001030, 0x3333);   /* +0x30 */
+        memory_write16(&memory, 0x020010A0, 0xAAAA);   /* +0xA0 */
+        memory_write16(&memory, 0x02000FFC, 0x4444);   /* -0x04 */
+        cpu.reg[1] = 0x02001000;
+        run_one(&cpu, &memory, 0x02000090, 0xE1D101B0); /* LDRH r0,[r1,#0x10] */
+        t_check("LDRH +0x10 reads imm4H=1", cpu.reg[0] == 0x1111);
+        run_one(&cpu, &memory, 0x02000090, 0xE1D103B0); /* LDRH r0,[r1,#0x30] */
+        t_check("LDRH +0x30 reads imm4H=3", cpu.reg[0] == 0x3333);
+        run_one(&cpu, &memory, 0x02000090, 0xE1D10AB0); /* LDRH r0,[r1,#0xA0] */
+        t_check("LDRH +0xA0 reads imm4H=A", cpu.reg[0] == 0xAAAA);
+        run_one(&cpu, &memory, 0x02000090, 0xE15100B4); /* LDRH r0,[r1,#-4] */
+        t_check("LDRH -0x04 subtracts the offset", cpu.reg[0] == 0x4444);
+
+        cpu.reg[0] = 0x5A5A;
+        run_one(&cpu, &memory, 0x02000090, 0xE1C103B0); /* STRH r0,[r1,#0x30] */
+        t_check("STRH +0x30 stores at the right place",
+                memory_read16(&memory, 0x02001030) == 0x5A5A);
+        run_one(&cpu, &memory, 0x02000090, 0xE1C10AB0); /* STRH r0,[r1,#0xA0] */
+        t_check("STRH +0xA0 stores at the right place",
+                memory_read16(&memory, 0x020010A0) == 0x5A5A);
+        run_one(&cpu, &memory, 0x02000090, 0xE14100B4); /* STRH r0,[r1,#-4] */
+        t_check("STRH -0x04 stores at the right place",
+                memory_read16(&memory, 0x02000FFC) == 0x5A5A);
+
+        /* LDRSB and LDRSH read the same flat field and are both sign
+         * extending. */
+        memory_write8(&memory, 0x02001025, 0xAD);
+        memory_write8(&memory, 0x02001026, 0xFF);
+        run_one(&cpu, &memory, 0x02000090, 0xE1D102D5); /* LDRSB r0,[r1,#0x25] */
+        t_check("LDRSB +0x25 sign extends", cpu.reg[0] == 0xFFFFFFADu);
+        run_one(&cpu, &memory, 0x02000090, 0xE1D102F5); /* LDRSH r0,[r1,#0x25] */
+        t_check("LDRSH +0x25 reads the misaligned halfword and extends",
+                cpu.reg[0] == 0xFFFFFFADu);
+
+        /* The register offset form is unaffected and still adds Rm. */
+        cpu.reg[4] = 0x10;
+        run_one(&cpu, &memory, 0x02000090, 0xE19100B4); /* LDRH r0,[r1,r4] */
+        t_check("LDRH register offset still works", cpu.reg[0] == 0x1111);
+    }
+
+    {   /* SWP and SWPB sit in the same instruction class as the halfword
+         * transfers, and are reached through a different bit pattern rather
+         * than being dead code. */
+        memory_write32(&memory, 0x02000640, 0xA1B2C3D4u);
+        cpu.reg[0] = 0x11111111u;
+        cpu.reg[2] = 0x02000640;
+        cpu.reg[5] = 0x0000FFFFu;
+        run_one(&cpu, &memory, 0x020000A0, 0xE1020095); /* SWP r0,r5,[r2] */
+        t_check("SWP loads the old word", cpu.reg[0] == 0xA1B2C3D4u);
+        t_check("SWP stores the new word",
+                memory_read32(&memory, 0x02000640) == 0x0000FFFFu);
+        memory_write32(&memory, 0x02000640, 0xA1B2C3D4u);
+        run_one(&cpu, &memory, 0x020000A0, 0xE1420095); /* SWPB r0,r5,[r2] */
+        t_check("SWPB stores only the low byte",
+                memory_read32(&memory, 0x02000640) == 0xA1B2C3FFu);
     }
 
     {   /* LDRB R0, [R1] and LDRSB sign extend */
@@ -738,12 +1669,14 @@ int main(void) {
         hw_io_write(&hw, 0xB2, 0x0300, 16);
         hw_io_write(&hw, 0xB4, 0x0000, 16);           /* DMA0 dst = 0x06000000 */
         hw_io_write(&hw, 0xB6, 0x0600, 16);
-        hw_io_write(&hw, 0xB8, 3, 16);                /* count-1 = 3 */
+        hw_io_write(&hw, 0xB8, 3, 16);                /* 3 halfwords */
         hw.if_ = 0;
         hw_io_write(&hw, 0xBA, 0xC000, 16);           /* enable + IRQ, start=NOW */
-        t_check("DMA0 copied CNT_L+1 halfwords",
+        t_check("DMA0 copied CNT_L halfwords",
                 memory_read16(&memory, 0x06000000) == 0x1000 &&
-                memory_read16(&memory, 0x06000006) == 0x1003);
+                memory_read16(&memory, 0x06000004) == 0x1002);
+        t_check("DMA0 stopped after CNT_L units",
+                memory_read16(&memory, 0x06000006) == 0);
         t_check("DMA0 raises DMA IRQ on end", (hw.if_ & HW_IRQ_DMA0) != 0);
         t_check("DMA0 one-shot clears enable", (hw.dma[0].cnt & 0x8000) == 0);
 
@@ -1003,6 +1936,10 @@ int main(void) {
 
     test_bios_services();
     test_boot_rom();
+    test_long_multiply(&memory);
+    test_sound();
+    test_cartridge_backup();
+    test_8bpp_opaque();
 
     printf("\n%d/%d passed\n", total_tests - failures, total_tests);
 

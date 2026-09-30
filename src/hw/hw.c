@@ -28,6 +28,27 @@ uint16_t hw_timer_read(HW *hw, int index) {
     return (uint16_t)(t->reload + (timer_ticks(hw, index) & 0xFFFF));
 }
 
+/* CPU cycles between two overflows of a timer, or 0 when it is stopped.
+ * A timer counts up from its reload value and wraps at 0x10000, so the
+ * period is what is left to the top of the counter, scaled by the
+ * prescaler.  A cascaded timer is clocked by the previous timer's
+ * overflows rather than by CPU cycles. */
+static uint64_t timer_overflow_period(const HW *hw, int i) {
+    const HWTimer *t = &hw->timer[i];
+
+    if (!(t->cnt & 0x80)) {
+        return 0;
+    }
+    if (t->cnt & 0x04) {
+        if (i == 0) {
+            return 0;
+        }
+        uint64_t prev = timer_overflow_period(hw, i - 1);
+        return prev ? prev * (uint64_t)(0x10000u - t->reload) : 0;
+    }
+    return (uint64_t)(0x10000u - t->reload) * timer_prescaler[t->cnt & 3];
+}
+
 /* ---- DMA helpers -------------------------------------------------------- */
 
 void hw_dma_run(HW *hw, int index) {
@@ -46,10 +67,11 @@ void hw_dma_run(HW *hw, int index) {
     dst = d->dest & 0x0FFFFFFFu;
     count = d->count;
 
+    /* CNT_L holds the number of units to transfer, not that number minus one.
+     * A value of zero means the maximum length: 0x4000 for DMA0-2 and 0x10000
+     * for DMA3. */
     if (count == 0) {
-        count = width32 ? 0x4000u : 0x10000u;
-    } else {
-        count += 1; /* CNT_L holds transfer count minus one */
+        count = (index == 3) ? 0x10000u : 0x4000u;
     }
 
     stride = width32 ? 4 : 2;
@@ -60,8 +82,10 @@ void hw_dma_run(HW *hw, int index) {
         } else {
             memory_write16(hw->mem, dst, memory_read16(hw->mem, src));
         }
-        switch (sc) { case 0: src += stride; break; case 1: src -= stride; break; default: break; }
-        switch (dc) { case 0: dst += stride; break; case 1: dst -= stride; break; default: break; }
+        /* Address control: 0 increment, 1 decrement, 2 fixed.  Destination
+         * control 3 also increments, but reloads DAD after a repeat. */
+        switch (sc) { case 1: src -= stride; break; case 2: break; default: src += stride; break; }
+        switch (dc) { case 1: dst -= stride; break; case 2: break; default: dst += stride; break; }
     }
 
     if (d->cnt & (1u << 14)) {
@@ -74,7 +98,8 @@ void hw_dma_run(HW *hw, int index) {
 
 void hw_dma_on_event(HW *hw, int condition) {
     for (int i = 0; i < 4; i++) {
-        if ((hw->dma[i].cnt & 0x8000) && (((hw->dma[i].cnt >> 12) & 3) == condition)) {
+        if ((hw->dma[i].cnt & 0x8000) &&
+            (((hw->dma[i].cnt >> 12) & 3) == condition)) {
             hw_dma_run(hw, i);
         }
     }
@@ -173,6 +198,15 @@ uint16_t hw_tick(HW *hw, uint32_t cycles) {
     if (raised) {
         hw->if_ |= raised;
     }
+
+    /* The DirectSound FIFOs are clocked by TM0/TM1, whichever SOUNDCNT_H
+     * selected, so the sound engine sees the real sample rate. */
+    for (int i = 0; i < 2; i++) {
+        uint64_t period = timer_overflow_period(hw, hw->sound.dma_timer[i]);
+        hw->sound.fifo_timer[i] =
+            (period && period <= 0xFFFFFFFFu) ? (uint32_t)period : 0u;
+    }
+    sound_tick(&hw->sound, hw->cycles);
     return raised;
 }
 
@@ -224,6 +258,12 @@ uint32_t hw_io_read(HW *hw, uint32_t address, int width) {
     if (address < 0x60) {
         return ppu_io_read16(hw->ppu, address);
     }
+    {
+        uint16_t v = 0;
+        if (sound_read16(&hw->sound, address | 0x4000000u, &v)) {
+            return v;
+        }
+    }
     return 0;
 }
 
@@ -239,6 +279,12 @@ void hw_io_write(HW *hw, uint32_t address, uint32_t value, int width) {
         return;
     }
     if (width == 32) {
+        uint32_t io = address & 0x3FFu;
+        if (io >= 0xA0u && io <= 0xB7u) {
+            /* A FIFO word is four samples, so it must not be split. */
+            sound_write32(&hw->sound, io | 0x4000000u, value);
+            return;
+        }
         hw_io_write(hw, address, value & 0xFFFF, 16);
         hw_io_write(hw, address + 2, value >> 16, 16);
         return;
@@ -316,7 +362,9 @@ void hw_io_write(HW *hw, uint32_t address, uint32_t value, int width) {
 
     if (address < 0x60) {
         ppu_io_write16(hw->ppu, address, (uint16_t)value);
+        return;
     }
+    sound_write16(&hw->sound, address | 0x4000000u, (uint16_t)value);
 }
 
 /* ---- lifecycle ------------------------------------------------------------ */
@@ -326,6 +374,7 @@ void hw_init(HW *hw, Memory *mem, CPU *cpu, PPU *ppu) {
     hw->mem = mem;
     hw->cpu = cpu;
     hw->ppu = ppu;
+    sound_init(&hw->sound);
     hw_reset(hw);
 }
 
@@ -343,4 +392,5 @@ void hw_reset(HW *hw) {
     hw->bios_irq_flags = 0;
     memset(hw->timer, 0, sizeof(hw->timer));
     memset(hw->dma, 0, sizeof(hw->dma));
+    sound_reset(&hw->sound);
 }
