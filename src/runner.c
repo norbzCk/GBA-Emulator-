@@ -125,9 +125,31 @@ static char *put_pixel(char *p, unsigned v) {
     return p;
 }
 
+/* Mean of the scale x scale block of source pixels at (x0, y0). A cell covers
+ * scale x scale pixels on each half, so point sampling one of them drops the
+ * rest of the block and the image shimmers; averaging uses all of them. */
+static uint32_t average_block(const uint32_t *pixels, int x0, int y0, int n) {
+    unsigned r = 0, g = 0, b = 0;
+    unsigned cells = (unsigned)(n * n);
+
+    for (int y = y0; y < y0 + n; y++) {
+        const uint32_t *line = pixels + (size_t)y * PPU_W;
+        for (int x = x0; x < x0 + n; x++) {
+            uint32_t p = line[x];
+            r += (p >> 16) & 0xFF;
+            g += (p >> 8) & 0xFF;
+            b += p & 0xFF;
+        }
+    }
+    return ((r / cells) << 16) | ((g / cells) << 8) | (b / cells);
+}
+
 /* Draw the frame as half-block cells (two scanlines per character row). */
 static void render_ansi(const uint32_t *pixels, int scale) {
-    enum { CELL_BYTES = 40 };
+    /* Worst case per cell: "\x1b[38;2;" plus 3+1+3+1+3 digits plus "m" is 19
+     * bytes, the same again for the background, the block glyph is 3, and the
+     * row terminator "\x1b[0m\n" adds 5. */
+    enum { CELL_BYTES = 48 };
     char *row = malloc((size_t)(PPU_W / scale) * CELL_BYTES + 8);
     int rows = PPU_H / (2 * scale);
 
@@ -138,8 +160,8 @@ static void render_ansi(const uint32_t *pixels, int scale) {
         char *p = row;
         for (int cx = 0; cx < PPU_W / scale; cx++) {
             int x = cx * scale;
-            uint32_t top = pixels[(cy * 2 * scale) * PPU_W + x];
-            uint32_t bot = pixels[(cy * 2 * scale + scale) * PPU_W + x];
+            uint32_t top = average_block(pixels, x, cy * 2 * scale, scale);
+            uint32_t bot = average_block(pixels, x, cy * 2 * scale + scale, scale);
 
             memcpy(p, "\x1b[38;2;", 7); p += 7;
             p = put_pixel(p, (top >> 16) & 0xFF);
@@ -147,7 +169,8 @@ static void render_ansi(const uint32_t *pixels, int scale) {
             p = put_pixel(p, (top >> 8) & 0xFF);
             *p++ = ';';
             p = put_pixel(p, top & 0xFF);
-            memcpy(p, "m\x1b[48;2;", 7); p += 7;
+            *p++ = 'm';
+            memcpy(p, "\x1b[48;2;", 7); p += 7;
             p = put_pixel(p, (bot >> 16) & 0xFF);
             *p++ = ';';
             p = put_pixel(p, (bot >> 8) & 0xFF);
@@ -157,11 +180,7 @@ static void render_ansi(const uint32_t *pixels, int scale) {
             memcpy(p, "\xe2\x96\x80", 3); /* U+2580 upper half block */
             p += 3;
         }
-        *p++ = '\x1b';
-        *p++ = '[';
-        *p++ = '0';
-        *p++ = 'm';
-        *p++ = '\n';
+        memcpy(p, "\x1b[0m\n", 5); p += 5;
         fwrite(row, 1, (size_t)(p - row), stdout);
     }
     fflush(stdout);
